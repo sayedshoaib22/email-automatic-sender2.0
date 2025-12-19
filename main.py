@@ -13,27 +13,25 @@ import threading
 import re
 import os
 import html
-import json
 import sqlite3
-from PIL import Image, ImageTk  # Required for Logo/Watermark handling
+import json
+from PIL import Image, ImageTk
 
 # ------------------ CONFIG ------------------
 SENDER_EMAIL = "vartisticstudio@gmail.com"
-SENDER_APP_PASSWORD = "ncei olgn ykrl bwop"   # DO NOT SHARE THIS FILE PUBLICLY
+SENDER_APP_PASSWORD = "ncei olgn ykrl bwop"
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 
 EMAIL_REGEX = re.compile(r"[^@]+@[^@]+\.[^@]+")
 PLACEHOLDER_REGEX = re.compile(r"\{([^}]+)\}")
 
-# Possible column names
 NAME_COLUMN_CANDIDATES = {"name", "names", "full name", "customer name", "student name"}
 EMAIL_COLUMN_CANDIDATES = {"email", "emails", "e-mail", "mail", "mail id", "email id", "gmail"}
 SUBJECT_COLUMN_CANDIDATES = {"subject", "heading", "title"}
 BODY_COLUMN_CANDIDATES = {"body", "message", "content", "description"}
 
 DB_FILE = "mailer.db"
-
 
 # ------------------ SQLITE HELPERS ------------------
 def init_sqlite():
@@ -48,9 +46,41 @@ def init_sqlite():
         file_path TEXT,
         current_index INTEGER
     )''')
+    # Add new columns if missing (safe ALTERs)
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN subject TEXT DEFAULT ''")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN body TEXT DEFAULT ''")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN inline_images TEXT DEFAULT ''")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN general_attachments TEXT DEFAULT ''")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN skip_dup INTEGER DEFAULT 1")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN respect_global INTEGER DEFAULT 0")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN mark_excel INTEGER DEFAULT 0")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE recovery_state ADD COLUMN use_row_content INTEGER DEFAULT 0")
+    except:
+        pass
     conn.commit()
     conn.close()
-
 
 def sqlite_load_sent_emails():
     conn = sqlite3.connect(DB_FILE)
@@ -59,7 +89,6 @@ def sqlite_load_sent_emails():
     rows = c.fetchall()
     conn.close()
     return set(r[0].strip().lower() for r in rows)
-
 
 def sqlite_save_sent_email(email):
     conn = sqlite3.connect(DB_FILE)
@@ -72,25 +101,50 @@ def sqlite_save_sent_email(email):
         pass
     conn.close()
 
-
 def sqlite_load_recovery_state():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("SELECT file_path, current_index FROM recovery_state WHERE id = 1")
-    row = c.fetchone()
+    # Select as many columns as exist; handle older DBs gracefully
+    try:
+        c.execute("SELECT file_path, current_index, subject, body, inline_images, general_attachments, skip_dup, respect_global, mark_excel, use_row_content FROM recovery_state WHERE id = 1")
+        row = c.fetchone()
+    except:
+        c.execute("SELECT file_path, current_index FROM recovery_state WHERE id = 1")
+        row = c.fetchone()
     conn.close()
     if row:
-        return {"file_path": row[0], "current_index": row[1]}
-    return None
+        # Map row to keys with defaults
+        res = {"file_path": None, "current_index": 0, "subject": "", "body": "", "inline_images": [], "general_attachments": [],
+               "skip_dup": 1, "respect_global": 0, "mark_excel": 0, "use_row_content": 0}
+        try:
+            res["file_path"] = row[0]
+            res["current_index"] = row[1]
+        except: pass
+        try:
+            res["subject"] = row[2] or ""
+            res["body"] = row[3] or ""
+            res["inline_images"] = json.loads(row[4]) if row[4] else []
+            res["general_attachments"] = json.loads(row[5]) if row[5] else []
+            res["skip_dup"] = int(row[6] or 1)
+            res["respect_global"] = int(row[7] or 0)
+            res["mark_excel"] = int(row[8] or 0)
+            res["use_row_content"] = int(row[9] or 0)
+        except Exception:
+            pass
+        return res
 
-
-def sqlite_save_recovery_state(file_path, current_index):
+def sqlite_save_recovery_state(file_path, current_index, subject="", body="", inline_images_json="", general_attachments_json="", skip_dup=1, respect_global=0, mark_excel=0, use_row_content=0):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO recovery_state (id, file_path, current_index) VALUES (1, ?, ?)", (file_path, int(current_index)))
+    try:
+        c.execute(
+            "INSERT OR REPLACE INTO recovery_state (id, file_path, current_index, subject, body, inline_images, general_attachments, skip_dup, respect_global, mark_excel, use_row_content) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (file_path, int(current_index), subject, body, inline_images_json, general_attachments_json, int(skip_dup), int(respect_global), int(mark_excel), int(use_row_content))
+        )
+    except Exception:
+        c.execute("INSERT OR REPLACE INTO recovery_state (id, file_path, current_index) VALUES (1, ?, ?)", (file_path, int(current_index)))
     conn.commit()
     conn.close()
-
 
 def sqlite_clear_recovery_state():
     conn = sqlite3.connect(DB_FILE)
@@ -99,6 +153,13 @@ def sqlite_clear_recovery_state():
     conn.commit()
     conn.close()
 
+def sqlite_get_all_history():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT email, sent_at FROM sent_emails ORDER BY sent_at DESC")
+    rows = c.fetchall()
+    conn.close()
+    return rows
 
 # ------------------ APP CLASS ------------------
 class EmailAutomationApp:
@@ -106,14 +167,14 @@ class EmailAutomationApp:
         init_sqlite()
         self.root = root
         self.root.title("Vartistic Studio | Pro Mailer Engine")
-        self.root.geometry("1300x850")
+        self.root.geometry("1400x900")
         self.root.minsize(1200, 750)
         
         # Logic Variables
         self.file_path = None
         self.selected_image_path = None
         self.inline_images = []
-        self.general_attachments = [] # NEW: For files/videos/photos
+        self.general_attachments = []
         self.image_url_column = ""
         self.is_sending = False
 
@@ -127,10 +188,8 @@ class EmailAutomationApp:
         self.skipped_count = 0
         self.total_count = 0
 
-        self.state_file = "email_state.json"
         self.resume_from_index = 0
         self.resuming = False
-        self.sent_email_store = "sent_emails.json"
         self.sent_emails_global = self._load_sent_emails()
         self.result_rows = []
 
@@ -139,7 +198,6 @@ class EmailAutomationApp:
         self.create_ui()
         self._check_recovery_state()
 
-    # ------------------ DARK THEME STYLING ------------------
     def _setup_style(self):
         style = ttk.Style()
         try:
@@ -169,33 +227,36 @@ class EmailAutomationApp:
         style.configure("H2.TLabel", background=self.colors["panel_bg"], foreground=self.colors["accent"], font=("Segoe UI", 14, "bold"))
         style.configure("Label.TLabel", background=self.colors["panel_bg"], foreground=self.colors["text_dim"], font=("Segoe UI", 10))
 
-        # Buttons
         style.configure("Accent.TButton", background=self.colors["accent"], foreground="white", font=("Segoe UI", 11, "bold"), borderwidth=0, padding=10)
         style.map("Accent.TButton", background=[("active", self.colors["accent_hover"])])
 
         style.configure("Dark.TButton", background=self.colors["input_bg"], foreground=self.colors["text_main"], borderwidth=1, font=("Segoe UI", 10))
         style.map("Dark.TButton", background=[("active", "#505050")])
 
-        # --- MODIFIED CHECKBUTTON (Removed white selection box) ---
         style.configure("TCheckbutton", 
                         background=self.colors["panel_bg"], 
                         foreground=self.colors["text_main"], 
                         font=("Segoe UI", 10),
-                        focuscolor=self.colors["panel_bg"]) # Removes the focus border
+                        focuscolor=self.colors["panel_bg"])
         style.map("TCheckbutton", 
                   background=[("active", self.colors["panel_bg"]), ("selected", self.colors["panel_bg"])],
                   foreground=[("active", self.colors["text_main"])],
                   indicatorcolor=[("selected", self.colors["accent"]), ("!selected", self.colors["bg_dark"])])
 
         style.configure("TEntry", fieldbackground=self.colors["input_bg"], foreground="white", insertcolor="white", borderwidth=0)
-        style.configure("StatNum.TLabel", background=self.colors["input_bg"], foreground=self.colors["text_main"], font=("Consolas", 22, "bold"))
+        
+        # Notebook (Tabs) styling
+        style.configure("TNotebook", background=self.colors["bg_dark"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=self.colors["input_bg"], foreground=self.colors["text_dim"], 
+                       padding=[20, 10], font=("Segoe UI", 11, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", self.colors["panel_bg"])], 
+                 foreground=[("selected", self.colors["accent"])])
 
     def create_ui(self):
         # --- HEADER ---
         header = ttk.Frame(self.root, style="Main.TFrame", padding=(20, 20, 20, 0))
         header.pack(fill="x")
         
-        # LOGO INTEGRATION (TOP LEFT)
         try:
             logo_img = Image.open("logo.png")
             logo_img = logo_img.resize((150, 80), Image.Resampling.LANCZOS)
@@ -203,7 +264,7 @@ class EmailAutomationApp:
             logo_label = tk.Label(header, image=self.logo_photo, bg=self.colors["bg_dark"])
             logo_label.pack(side="left", padx=(10, 10))
         except:
-            pass # Logo file missing
+            pass
 
         ttk.Label(header, text="VARTISTIC STUDIO | AUTOMATION ENGINE", style="H1.TLabel").pack(side="left")
         
@@ -214,8 +275,22 @@ class EmailAutomationApp:
         self.status_text = tk.Label(status_frame, text="SYSTEM IDLE", bg=self.colors["bg_dark"], fg="#555555", font=("Segoe UI", 10, "bold"))
         self.status_text.pack(side="left", padx=5)
 
-        # --- MAIN CONTENT SPLIT ---
-        main_body = ttk.Frame(self.root, style="Main.TFrame", padding=20)
+        # --- TABBED INTERFACE ---
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=20, pady=(10, 20))
+
+        # TAB 1: MAILER
+        self.tab_mailer = ttk.Frame(self.notebook, style="Main.TFrame")
+        self.notebook.add(self.tab_mailer, text="📧 MAILER")
+        self._create_mailer_tab()
+
+        # TAB 2: HISTORY
+        self.tab_history = ttk.Frame(self.notebook, style="Main.TFrame")
+        self.notebook.add(self.tab_history, text="📊 HISTORY")
+        self._create_history_tab()
+
+    def _create_mailer_tab(self):
+        main_body = ttk.Frame(self.tab_mailer, style="Main.TFrame", padding=10)
         main_body.pack(fill="both", expand=True)
 
         left_col = ttk.Frame(main_body, style="Main.TFrame")
@@ -255,18 +330,15 @@ class EmailAutomationApp:
         self.body_text = scrolledtext.ScrolledText(p2, height=8, bg=self.colors["input_bg"], fg="white", insertbackground="white", relief="flat", font=("Consolas", 10))
         self.body_text.pack(fill="both", expand=True, pady=(2, 10))
 
-        # NEW: ATTACHMENTS AREA
         attach_frame = ttk.Frame(p2, style="Panel.TFrame")
         attach_frame.pack(fill="x")
         
-        # Inline Images
         img_row = ttk.Frame(attach_frame, style="Panel.TFrame")
         img_row.pack(side="left")
         ttk.Button(img_row, text="+ INLINE IMAGES", style="Dark.TButton", command=self.browse_image).pack(side="left")
         self.image_label = ttk.Label(img_row, text="0 images", style="Label.TLabel")
         self.image_label.pack(side="left", padx=5)
 
-        # General Files (NEW)
         gen_row = ttk.Frame(attach_frame, style="Panel.TFrame")
         gen_row.pack(side="right")
         ttk.Button(gen_row, text="+ ATTACH FILES/VIDEO", style="Dark.TButton", command=self.browse_general_files).pack(side="left")
@@ -297,35 +369,249 @@ class EmailAutomationApp:
         make_stat_box(stats_frame, "FAILED", "lbl_failed", self.colors["warning"])
         make_stat_box(stats_frame, "SKIPPED", "lbl_skipped", "#888888")
 
-        # --- TERMINAL LOG WITH WATERMARK ---
-        log_panel = ttk.Frame(right_col, style="Panel.TFrame")
-        log_panel.pack(fill="both", expand=True)
+        # --- ENHANCED LOG PANEL ---
+        log_container = ttk.Frame(right_col, style="Panel.TFrame", padding=15)
+        log_container.pack(fill="both", expand=True)
+        
+        log_header = ttk.Frame(log_container, style="Panel.TFrame")
+        log_header.pack(fill="x", pady=(0, 10))
+        ttk.Label(log_header, text="TRANSMISSION LOG", style="H2.TLabel").pack(side="left")
+        
+        # Clear log button
+        ttk.Button(log_header, text="CLEAR", style="Dark.TButton", command=self.clear_log).pack(side="right")
 
-        # The Log Box
+        # Enhanced log with better styling
+        log_frame = tk.Frame(log_container, bg="#000000", relief="flat", bd=0)
+        log_frame.pack(fill="both", expand=True)
+        
         self.log_box = scrolledtext.ScrolledText(
-            log_panel, state="disabled", background="#000000", foreground="#00ff00",
+            log_frame, state="disabled", background="#000000", foreground="#00ff00",
             insertbackground="#00ff00", font=("Consolas", 9), borderwidth=0, padx=10, pady=10
         )
         self.log_box.pack(fill="both", expand=True)
 
-        # WATERMARK INTEGRATION (Bottom Right of Log Panel)
-        self._add_watermark(log_panel)
+        self._add_watermark(log_frame)
+
+    def _create_history_tab(self):
+        history_container = ttk.Frame(self.tab_history, style="Main.TFrame", padding=20)
+        history_container.pack(fill="both", expand=True)
+
+        # Header
+        header_frame = ttk.Frame(history_container, style="Panel.TFrame", padding=15)
+        header_frame.pack(fill="x", pady=(0, 15))
+        
+        ttk.Label(header_frame, text="📊 EMAIL HISTORY", style="H2.TLabel").pack(side="left")
+        
+        button_frame = ttk.Frame(header_frame, style="Panel.TFrame")
+        button_frame.pack(side="right")
+        
+        ttk.Button(button_frame, text="🔄 REFRESH", style="Dark.TButton", command=self.refresh_history).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="📥 EXPORT CSV", style="Dark.TButton", command=self.export_history).pack(side="left", padx=5)
+        ttk.Button(button_frame, text="🗑️ CLEAR ALL", style="Dark.TButton", command=self.clear_history).pack(side="left", padx=5)
+
+        # Stats panel
+        stats_panel = ttk.Frame(history_container, style="Panel.TFrame", padding=15)
+        stats_panel.pack(fill="x", pady=(0, 15))
+        
+        self.history_stats_label = tk.Label(
+            stats_panel, 
+            text="Total Emails Sent: 0", 
+            bg=self.colors["panel_bg"], 
+            fg=self.colors["accent"], 
+            font=("Segoe UI", 12, "bold")
+        )
+        self.history_stats_label.pack(anchor="w")
+
+        # Search frame
+        search_frame = ttk.Frame(history_container, style="Panel.TFrame", padding=15)
+        search_frame.pack(fill="x", pady=(0, 15))
+        
+        ttk.Label(search_frame, text="🔍 Search:", style="Label.TLabel").pack(side="left", padx=(0, 10))
+        self.search_entry = tk.Entry(
+            search_frame, 
+            bg=self.colors["input_bg"], 
+            fg="white", 
+            insertbackground="white", 
+            relief="flat", 
+            font=("Segoe UI", 10)
+        )
+        self.search_entry.pack(side="left", fill="x", expand=True, ipady=5)
+        self.search_entry.bind('<KeyRelease>', lambda e: self.filter_history())
+        
+        ttk.Button(search_frame, text="CLEAR", style="Dark.TButton", command=self.clear_search).pack(side="left", padx=(10, 0))
+
+        # Treeview for history
+        tree_frame = ttk.Frame(history_container, style="Panel.TFrame", padding=15)
+        tree_frame.pack(fill="both", expand=True)
+
+        # Scrollbars
+        tree_scroll_y = ttk.Scrollbar(tree_frame)
+        tree_scroll_y.pack(side="right", fill="y")
+        
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal")
+        tree_scroll_x.pack(side="bottom", fill="x")
+
+        # Create treeview with custom styling
+        style = ttk.Style()
+        style.configure("History.Treeview", 
+                       background=self.colors["input_bg"],
+                       foreground=self.colors["text_main"],
+                       fieldbackground=self.colors["input_bg"],
+                       borderwidth=0,
+                       font=("Segoe UI", 10))
+        style.configure("History.Treeview.Heading",
+                       background=self.colors["panel_bg"],
+                       foreground=self.colors["accent"],
+                       borderwidth=0,
+                       font=("Segoe UI", 11, "bold"))
+        style.map("History.Treeview", background=[("selected", self.colors["accent"])])
+
+        self.history_tree = ttk.Treeview(
+            tree_frame,
+            columns=("No", "Email", "Sent At", "Date", "Time"),
+            show="headings",
+            yscrollcommand=tree_scroll_y.set,
+            xscrollcommand=tree_scroll_x.set,
+            style="History.Treeview"
+        )
+        
+        tree_scroll_y.config(command=self.history_tree.yview)
+        tree_scroll_x.config(command=self.history_tree.xview)
+
+        # Define columns
+        self.history_tree.heading("No", text="NO")
+        self.history_tree.heading("Email", text="EMAIL ADDRESS")
+        self.history_tree.heading("Sent At", text="SENT AT")
+        self.history_tree.heading("Date", text="DATE")
+        self.history_tree.heading("Time", text="TIME")
+
+        self.history_tree.column("No", width=50, anchor="center")
+        self.history_tree.column("Email", width=300, anchor="w")
+        self.history_tree.column("Sent At", width=200, anchor="center")
+        self.history_tree.column("Date", width=120, anchor="center")
+        self.history_tree.column("Time", width=120, anchor="center")
+
+        self.history_tree.pack(fill="both", expand=True)
+
+        # Load initial data
+        self.refresh_history()
+
+    def refresh_history(self):
+        """Load history data from database"""
+        # Clear existing items
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        
+        # Load data from database
+        history_data = sqlite_get_all_history()
+        
+        # Update stats
+        self.history_stats_label.config(text=f"Total Emails Sent: {len(history_data)}")
+        
+        # Populate tree
+        for idx, (email, sent_at) in enumerate(history_data, 1):
+            try:
+                # Parse datetime
+                dt = datetime.fromisoformat(sent_at)
+                date_str = dt.strftime("%Y-%m-%d")
+                time_str = dt.strftime("%H:%M:%S")
+                display_datetime = dt.strftime("%Y-%m-%d %H:%M:%S")
+                
+                self.history_tree.insert("", "end", values=(idx, email, display_datetime, date_str, time_str))
+            except:
+                self.history_tree.insert("", "end", values=(idx, email, sent_at, "N/A", "N/A"))
+
+    def filter_history(self):
+        """Filter history based on search term"""
+        search_term = self.search_entry.get().strip().lower()
+        
+        # Clear tree
+        for item in self.history_tree.get_children():
+            self.history_tree.delete(item)
+        
+        # Load and filter data
+        history_data = sqlite_get_all_history()
+        
+        filtered_count = 0
+        for idx, (email, sent_at) in enumerate(history_data, 1):
+            if search_term == "" or search_term in email.lower():
+                try:
+                    dt = datetime.fromisoformat(sent_at)
+                    date_str = dt.strftime("%Y-%m-%d")
+                    time_str = dt.strftime("%H:%M:%S")
+                    display_datetime = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    self.history_tree.insert("", "end", values=(filtered_count + 1, email, display_datetime, date_str, time_str))
+                    filtered_count += 1
+                except:
+                    self.history_tree.insert("", "end", values=(filtered_count + 1, email, sent_at, "N/A", "N/A"))
+                    filtered_count += 1
+        
+        self.history_stats_label.config(text=f"Showing: {filtered_count} of {len(history_data)} emails")
+
+    def clear_search(self):
+        """Clear search and show all results"""
+        self.search_entry.delete(0, tk.END)
+        self.refresh_history()
+
+    def export_history(self):
+        """Export history to CSV"""
+        try:
+            history_data = sqlite_get_all_history()
+            
+            if not history_data:
+                messagebox.showinfo("No Data", "No history data to export.")
+                return
+            
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".csv",
+                filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+                initialfile=f"email_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            )
+            
+            if file_path:
+                df = pd.DataFrame(history_data, columns=["Email", "Sent At"])
+                df.to_csv(file_path, index=False)
+                messagebox.showinfo("Success", f"History exported to:\n{file_path}")
+                
+        except Exception as e:
+            messagebox.showerror("Export Error", f"Failed to export history:\n{e}")
+
+    def clear_history(self):
+        """Clear all history from database"""
+        if messagebox.askyesno("Confirm Clear", "Are you sure you want to clear ALL email history?\n\nThis action cannot be undone."):
+            try:
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                c.execute("DELETE FROM sent_emails")
+                conn.commit()
+                conn.close()
+                
+                self.refresh_history()
+                self.sent_emails_global = set()
+                messagebox.showinfo("Success", "All history has been cleared.")
+                
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to clear history:\n{e}")
+
+    def clear_log(self):
+        """Clear the log box"""
+        self.log_box.configure(state="normal")
+        self.log_box.delete("1.0", tk.END)
+        self.log_box.configure(state="disabled")
 
     def _add_watermark(self, parent):
         try:
             w_img = Image.open("logo.png").convert("RGBA")
-            # Make it 150px wide and very transparent (alpha 30/255)
             w_img.thumbnail((180, 180))
             datas = w_img.getdata()
             newData = []
             for item in datas:
-                # item is (r, g, b, a) -> reduce 'a' for transparency
                 newData.append((item[0], item[1], item[2], int(item[3] * 0.15))) 
             w_img.putdata(newData)
             
             self.watermark_photo = ImageTk.PhotoImage(w_img)
             wm_label = tk.Label(parent, image=self.watermark_photo, bg="#000000", borderwidth=0)
-            # Place it absolutely in the bottom right of the log panel
             wm_label.place(relx=1.0, rely=1.0, anchor="se", x=-20, y=-20)
         except:
             pass
@@ -354,10 +640,11 @@ class EmailAutomationApp:
         except: pass
         self.image_label.config(text=f"{len(self.inline_images)} images", foreground=self.colors["success"])
 
-    def log(self, text):
+    def log(self, text, color="#00ff00"):
         self.log_box.configure(state="normal")
         ts = datetime.now().strftime("[%H:%M:%S]")
         self.log_box.insert("end", f"{ts} > {text}\n")
+        self.log_box.tag_config("color", foreground=color)
         self.log_box.configure(state="disabled")
         self.log_box.yview("end")
 
@@ -373,9 +660,6 @@ class EmailAutomationApp:
 
     def _load_sent_emails(self):
         return sqlite_load_sent_emails()
-
-    def _save_sent_emails(self):
-        pass
 
     def find_column(self, df, candidate_set):
         for col in df.columns:
@@ -457,7 +741,7 @@ class EmailAutomationApp:
         start = self.resume_from_index if self.resuming else 0
         seen_in_file = set()
 
-        # --- Performance cache: read files into memory once to avoid repeated disk I/O ---
+        # Performance cache
         image_bytes_cache = {}
         for p in set(self.inline_images or []):
             try:
@@ -480,7 +764,6 @@ class EmailAutomationApp:
             except:
                 attach_bytes_cache[p] = (None, None, None, os.path.basename(p))
 
-        # Cache logo bytes
         logo_bytes = None
         try:
             with open('logo.png', 'rb') as lf:
@@ -491,7 +774,9 @@ class EmailAutomationApp:
         for index, row in df.iterrows():
             if index < start: continue
             if not self.is_sending: break
-            self._save_recovery_state(index)
+            # Save the "next" index to ensure resumed session skips already-processed rows
+            # (previous behavior saved the current row index which caused duplicates on resume)
+            self._save_recovery_state(index + 1)
 
             name = str(row.get(name_col, "")).strip() if name_col else ""
             raw_email = row.get(email_col, "")
@@ -502,13 +787,9 @@ class EmailAutomationApp:
                 self.update_summary()
                 continue
 
-            if not email_list:
-                self.skipped_count += 1
-                self.update_summary()
-                # record skipped for rows without email
-                for _ in []: pass
-                continue
-                body = b_tmpl or g_body
+            if self.use_row_content.get():
+                subj = str(row.get(subj_col, "")).strip() if subj_col else g_subj
+                body = str(row.get(body_col, "")).strip() if body_col else g_body
             else:
                 subj = g_subj
                 body = g_body
@@ -536,34 +817,140 @@ class EmailAutomationApp:
                     final_html_parts.append(html.escape(p).replace("\n", "<br>"))
             
             html_content = "".join(final_html_parts)
-            full_html = f"""<!doctype html>
+            full_html = self._build_email_html(html_content)
+
+            for e_addr in email_list:
+                e_clean = e_addr.strip().lower()
+                if not EMAIL_REGEX.match(e_clean) or (self.skip_duplicates_in_file.get() and e_clean in seen_in_file) or (self.respect_global_history.get() and e_clean in self.sent_emails_global):
+                    self.skipped_count += 1
+                    self.update_summary()
+                    continue
+
+                msg = MIMEMultipart("mixed")
+                msg_alt = MIMEMultipart("related")
+                msg.attach(msg_alt)
+                
+                msg["From"] = SENDER_EMAIL
+                msg["To"] = e_clean
+                msg["Subject"] = subj_fin
+                msg_alt.attach(MIMEText(full_html, "html"))
+
+                for cid, path in inline_att:
+                    try:
+                        data = image_bytes_cache.get(path)
+                        if data:
+                            img = MIMEImage(data)
+                            img.add_header("Content-ID", f"<{cid}>")
+                            msg_alt.attach(img)
+                    except: pass
+
+                try:
+                    if logo_bytes:
+                        logo_img = MIMEImage(logo_bytes)
+                        logo_img.add_header("Content-ID", "<logo>")
+                        logo_img.add_header("Content-Disposition", "inline", filename="logo.png")
+                        msg_alt.attach(logo_img)
+                except: pass
+
+                for f_path in self.general_attachments:
+                    try:
+                        data, maintype, subtype, fname = attach_bytes_cache.get(f_path, (None, None, None, os.path.basename(f_path)))
+                        if data is None:
+                            with open(f_path, 'rb') as fp:
+                                data = fp.read()
+                            ctype, encoding = mimetypes.guess_type(f_path)
+                            if ctype is None or encoding is not None:
+                                maintype, subtype = ('application', 'octet-stream')
+                            else:
+                                maintype, subtype = ctype.split('/', 1)
+                            fname = os.path.basename(f_path)
+
+                        part = MIMEBase(maintype, subtype)
+                        part.set_payload(data)
+                        encoders.encode_base64(part)
+                        part.add_header('Content-Disposition', 'attachment', filename=fname)
+                        msg.attach(part)
+                    except Exception as e:
+                        self.log(f"Attach Error: {e}", "#ff6b6b")
+
+                try:
+                    server.send_message(msg)
+                    self.sent_count += 1
+                    self.sent_emails_global.add(e_clean)
+                    sqlite_save_sent_email(e_clean)
+                    seen_in_file.add(e_clean)
+                    self.log(f"✓ SENT → {e_clean}", "#4ec9b0")
+                    self.result_rows.append({"Name": name, "Email": e_clean, "Status": "✓", "RowIndex": index})
+                except Exception as ex:
+                    self.failed_count += 1
+                    self.log(f"✗ FAILED → {e_clean} ({ex})", "#ce9178")
+                self.update_summary()
+
+        server.quit()
+        self.set_status("COMPLETED", self.colors["success"])
+        self._clear_recovery_state()
+        
+        # Refresh history tab
+        self.refresh_history()
+        
+        # Mark Excel if requested
+        try:
+            if self.mark_excel_with_status.get() and self.file_path:
+                base, ext = os.path.splitext(self.file_path)
+                if self.result_rows:
+                    status_df = pd.DataFrame(self.result_rows)
+                else:
+                    status_df = pd.DataFrame(columns=["Name", "Email", "Status", "RowIndex"])
+
+                out_path = None
+                if ext.lower() in ('.xlsx', '.xls'):
+                    try:
+                        orig = pd.read_excel(self.file_path, engine="openpyxl")
+                        orig['Mailer_Status'] = ""
+                        for r in self.result_rows:
+                            try:
+                                ri = int(r.get('RowIndex', 0))
+                                if 0 <= ri < len(orig):
+                                    orig.at[ri, 'Mailer_Status'] = r.get('Status', '')
+                            except: pass
+                        out_path = f"{base}_status.xlsx"
+                        orig.to_excel(out_path, index=False)
+                    except Exception:
+                        out_path = f"{base}_status.xlsx"
+                        status_df.to_excel(out_path, index=False)
+                else:
+                    out_path = f"{base}_status.csv"
+                    status_df.to_csv(out_path, index=False)
+
+                if out_path:
+                    self.log(f"📄 Status file written: {out_path}", "#0098ff")
+        except Exception as e:
+            self.log(f"Status export error: {e}", "#ff6b6b")
+            
+        self.send_btn.configure(state="normal")
+        messagebox.showinfo("Done", f"Email sequence completed.\n\nSent: {self.sent_count}\nFailed: {self.failed_count}\nSkipped: {self.skipped_count}")
+
+    def _build_email_html(self, html_content):
+        return f"""<!doctype html>
 <html>
     <head>
         <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
         <style>
-            /* Basic reset */
             body {{ margin:0; padding:0; -webkit-text-size-adjust:100%; -ms-text-size-adjust:100%; background-color:#eef3fb; }}
             table {{ border-collapse:collapse; mso-table-lspace:0pt; mso-table-rspace:0pt; }}
             img {{ border:0; -ms-interpolation-mode:bicubic; max-width:100%; height:auto; display:block; }}
             a {{ color:inherit; text-decoration:none; }}
-
-            /* Container helpers */
             .outer {{ width:100%; background-color:#eef3fb; padding:24px 12px; }}
             .container {{ max-width:720px; margin:0 auto; }}
             .card {{ background:#ffffff; border-radius:12px; overflow:hidden; box-shadow:0 6px 18px rgba(12,34,64,0.06); }}
             .pad {{ padding:24px 26px; }}
-
-            /* Typography */
             .h1 {{ font-size:20px; font-weight:700; color:#134AAD; margin:0; }}
             .muted {{ color:#6b7280; font-size:12px; }}
             .body-text {{ font-size:15px; color:#0f1724; line-height:1.55; }}
-
-            /* Responsive: stack columns and reduce padding */
             @media only screen and (max-width:600px) {{
                 .container {{ width:100% !important; padding:0 8px !important; }}
                 .pad {{ padding:16px !important; }}
-                .two-col {{ display:block !important; width:100% !important; }}
                 .logo {{ width:48px !important; }}
                 .h1 {{ font-size:18px !important; }}
                 .body-text {{ font-size:14px !important; line-height:1.45 !important; }}
@@ -579,8 +966,6 @@ class EmailAutomationApp:
                         <tr>
                             <td align="center">
                                 <table role="presentation" width="100%" class="card" cellpadding="0" cellspacing="0">
-
-                                    <!-- Header -->
                                     <tr>
                                         <td style="padding:18px 22px; background:linear-gradient(180deg,#ffffff 0%,#f7fbff 100%);">
                                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
@@ -605,8 +990,6 @@ class EmailAutomationApp:
                                             </table>
                                         </td>
                                     </tr>
-
-                                    <!-- Body -->
                                     <tr>
                                         <td class="pad">
                                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
@@ -618,13 +1001,9 @@ class EmailAutomationApp:
                                             </table>
                                         </td>
                                     </tr>
-
-                                    <!-- Divider -->
                                     <tr>
                                         <td style="padding:0 22px;"><div style="height:1px; background:#eef5ff;">&nbsp;</div></td>
                                     </tr>
-
-                                    <!-- Footer -->
                                     <tr>
                                         <td style="padding:18px 22px 26px 22px; background:#ffffff;">
                                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
@@ -642,7 +1021,6 @@ class EmailAutomationApp:
                                             </table>
                                         </td>
                                     </tr>
-
                                 </table>
                             </td>
                         </tr>
@@ -655,124 +1033,6 @@ class EmailAutomationApp:
 </html>
 """
 
-            for e_addr in email_list:
-                e_clean = e_addr.strip().lower()
-                if not EMAIL_REGEX.match(e_clean) or (self.skip_duplicates_in_file.get() and e_clean in seen_in_file) or (self.respect_global_history.get() and e_clean in self.sent_emails_global):
-                    self.skipped_count += 1
-                    self.update_summary()
-                    continue
-
-                # MSG Construct (Support Mixed for general attachments)
-                msg = MIMEMultipart("mixed")
-                msg_alt = MIMEMultipart("related")
-                msg.attach(msg_alt)
-                
-                msg["From"] = SENDER_EMAIL
-                msg["To"] = e_clean
-                msg["Subject"] = subj_fin
-                msg_alt.attach(MIMEText(full_html, "html"))
-
-                # 1. Inline Images
-                for cid, path in inline_att:
-                    try:
-                        data = image_bytes_cache.get(path)
-                        if data:
-                            img = MIMEImage(data)
-                            img.add_header("Content-ID", f"<{cid}>")
-                            msg_alt.attach(img)
-                    except: pass
-
-                # Attach brand logo as inline image if available (CID used in template: 'logo')
-                try:
-                    if logo_bytes:
-                        logo_img = MIMEImage(logo_bytes)
-                        logo_img.add_header("Content-ID", "<logo>")
-                        logo_img.add_header("Content-Disposition", "inline", filename="logo.png")
-                        msg_alt.attach(logo_img)
-                except: pass
-
-                # 2. General File Attachments (NEW)
-                for f_path in self.general_attachments:
-                    try:
-                        data, maintype, subtype, fname = attach_bytes_cache.get(f_path, (None, None, None, os.path.basename(f_path)))
-                        if data is None:
-                            # fallback to reading directly
-                            with open(f_path, 'rb') as fp:
-                                data = fp.read()
-                            ctype, encoding = mimetypes.guess_type(f_path)
-                            if ctype is None or encoding is not None:
-                                maintype, subtype = ('application', 'octet-stream')
-                            else:
-                                maintype, subtype = ctype.split('/', 1)
-                            fname = os.path.basename(f_path)
-
-                        part = MIMEBase(maintype, subtype)
-                        part.set_payload(data)
-                        encoders.encode_base64(part)
-                        part.add_header('Content-Disposition', 'attachment', filename=fname)
-                        msg.attach(part)
-                    except Exception as e:
-                        self.log(f"Attach Error: {e}")
-
-                try:
-                    server.send_message(msg)
-                    self.sent_count += 1
-                    self.sent_emails_global.add(e_clean)
-                    sqlite_save_sent_email(e_clean)
-                    seen_in_file.add(e_clean)
-                    self.log(f"SENT -> {e_clean}")
-                    self.result_rows.append({"Name": name, "Email": e_clean, "Status": "✓", "RowIndex": index})
-                except Exception as ex:
-                    self.failed_count += 1
-                    self.log(f"FAILED -> {e_clean} ({ex})")
-                self.update_summary()
-
-        server.quit()
-        self.set_status("COMPLETED", self.colors["success"])
-        self._clear_recovery_state()
-        # If requested, mark the source file with send status or write a status file
-        try:
-            if self.mark_excel_with_status.get() and self.file_path:
-                base, ext = os.path.splitext(self.file_path)
-                # Build a DataFrame from result_rows
-                if self.result_rows:
-                    status_df = pd.DataFrame(self.result_rows)
-                else:
-                    status_df = pd.DataFrame(columns=["Name", "Email", "Status", "RowIndex"])
-
-                # If original file is Excel, attempt to load and write back a new Excel with a 'Mailer_Status' column
-                out_path = None
-                if ext.lower() in ('.xlsx', '.xls'):
-                    try:
-                        orig = pd.read_excel(self.file_path, engine="openpyxl")
-                        orig_cols = orig.columns.tolist()
-                        # default status column
-                        orig['Mailer_Status'] = ""
-                        for r in self.result_rows:
-                            try:
-                                ri = int(r.get('RowIndex', 0))
-                                # if index is within orig, set status
-                                if 0 <= ri < len(orig):
-                                    orig.at[ri, 'Mailer_Status'] = r.get('Status', '')
-                            except: pass
-                        out_path = f"{base}_status.xlsx"
-                        orig.to_excel(out_path, index=False)
-                    except Exception:
-                        # fallback: write summary file
-                        out_path = f"{base}_status.xlsx"
-                        status_df.to_excel(out_path, index=False)
-                else:
-                    # For CSV or other, write a CSV status summary
-                    out_path = f"{base}_status.csv"
-                    status_df.to_csv(out_path, index=False)
-
-                if out_path:
-                    self.log(f"Status file written: {out_path}")
-        except Exception as e:
-            self.log(f"Status export error: {e}")
-        self.send_btn.configure(state="normal")
-        messagebox.showinfo("Done", "Email sequence completed.")
-
     # ------------------ RECOVERY ------------------
     def _check_recovery_state(self):
         try:
@@ -782,13 +1042,50 @@ class EmailAutomationApp:
                 if saved_file and os.path.exists(saved_file):
                     if messagebox.askyesno("Recovery", "Resume session?"):
                         self.file_path = saved_file
+                        self.file_label.config(text=os.path.basename(self.file_path), foreground=self.colors["text_main"])
                         self.resume_from_index = data.get("current_index", 0)
                         self.resuming = True
+                        # Restore composer state if available
+                        try:
+                            subj = data.get("subject", "") or ""
+                            body = data.get("body", "") or ""
+                            self.subject_entry.delete(0, tk.END)
+                            self.subject_entry.insert(0, subj)
+                            self.body_text.delete("1.0", tk.END)
+                            self.body_text.insert("1.0", body)
+                        except: pass
+                        try:
+                            self.inline_images = data.get("inline_images", []) or []
+                            self.general_attachments = data.get("general_attachments", []) or []
+                            self.image_label.config(text=f"{len(self.inline_images)} images", foreground=self.colors["success"] if self.inline_images else self.colors["text_dim"]) 
+                            self.gen_attach_label.config(text=f"{len(self.general_attachments)} files", foreground=self.colors["success"] if self.general_attachments else self.colors["text_dim"]) 
+                        except: pass
+                        try:
+                            self.skip_duplicates_in_file.set(bool(data.get("skip_dup", 1)))
+                            self.respect_global_history.set(bool(data.get("respect_global", 0)))
+                            self.mark_excel_with_status.set(bool(data.get("mark_excel", 0)))
+                            self.use_row_content.set(bool(data.get("use_row_content", 0)))
+                        except: pass
+                        # Auto-start sending using restored state
+                        try:
+                            self.start_sending()
+                        except: pass
         except: pass
 
     def _save_recovery_state(self, current_index):
         try:
-            sqlite_save_recovery_state(self.file_path, current_index)
+            sqlite_save_recovery_state(
+                self.file_path,
+                current_index,
+                subject=(self.subject_entry.get().strip() if hasattr(self, 'subject_entry') else ""),
+                body=(self.body_text.get("1.0", "end").strip() if hasattr(self, 'body_text') else ""),
+                inline_images_json=(json.dumps(self.inline_images) if getattr(self, 'inline_images', None) is not None else json.dumps([])),
+                general_attachments_json=(json.dumps(self.general_attachments) if getattr(self, 'general_attachments', None) is not None else json.dumps([])),
+                skip_dup=int(self.skip_duplicates_in_file.get()),
+                respect_global=int(self.respect_global_history.get()),
+                mark_excel=int(self.mark_excel_with_status.get()),
+                use_row_content=int(self.use_row_content.get())
+            )
         except: pass
 
     def _clear_recovery_state(self):
@@ -797,16 +1094,42 @@ class EmailAutomationApp:
         except: pass
         self.resuming = False
 
-    def open_recovery_window(self) -> None:
+    def open_recovery_window(self):
         win = tk.Toplevel(self.root)
-        win.geometry("300x200")
+        win.title("Recovery Tools")
+        win.geometry("400x250")
         win.configure(bg=self.colors["panel_bg"])
 
+        ttk.Label(win, text="Recovery Tools", style="H2.TLabel").pack(pady=20)
+        
         ttk.Button(
             win,
-            text="CLEAR RECOVERY",
-            command=self._clear_recovery_state
-        ).pack(pady=20)
+            text="CLEAR RECOVERY STATE",
+            style="Dark.TButton",
+            command=lambda: [self._clear_recovery_state(), messagebox.showinfo("Done", "Recovery state cleared"), win.destroy()]
+        ).pack(pady=10, padx=20, fill="x")
+        
+        ttk.Button(
+            win,
+            text="VIEW RECOVERY INFO",
+            style="Dark.TButton",
+            command=self._show_recovery_info
+        ).pack(pady=10, padx=20, fill="x")
+        
+        ttk.Button(
+            win,
+            text="CLOSE",
+            style="Accent.TButton",
+            command=win.destroy
+        ).pack(pady=10, padx=20, fill="x")
+
+    def _show_recovery_info(self):
+        data = sqlite_load_recovery_state()
+        if data:
+            info = f"File: {data.get('file_path', 'N/A')}\nLast Index: {data.get('current_index', 0)}"
+            messagebox.showinfo("Recovery Info", info)
+        else:
+            messagebox.showinfo("Recovery Info", "No recovery state found.")
 
 if __name__ == "__main__":
     root = tk.Tk()
